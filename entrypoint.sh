@@ -8,7 +8,7 @@ MODEL_NAME="NEW_MODEL_NAME"
 if ! command -v nvidia-smi &> /dev/null
 then
     echo "ERROR: No nvidia-smi found. Ensure NVIDIA drivers are installed."
-    exit 1
+    #exit 1
 fi
 
 # Detect number of GPUs if not provided
