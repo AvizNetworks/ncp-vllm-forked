@@ -202,6 +202,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 ENV VLLM_USAGE_SOURCE production-docker-image
+ENV VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
 
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
 #################### OPENAI API SERVER ####################
