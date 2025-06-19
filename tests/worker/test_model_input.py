@@ -1,5 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import dataclasses
-from typing import List, Tuple, Type
 
 import torch
 
@@ -25,15 +27,15 @@ class MockAttentionBackend(AttentionBackend):
         raise NotImplementedError
 
     @staticmethod
-    def get_metadata_cls() -> Type["AttentionMetadata"]:
+    def get_metadata_cls() -> type["AttentionMetadata"]:
         return AttentionMetadata
 
     @staticmethod
-    def get_builder_cls() -> Type["AttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return AttentionMetadataBuilder
 
     @staticmethod
-    def get_state_cls() -> Type["CommonAttentionState"]:
+    def get_state_cls() -> type["CommonAttentionState"]:
         return CommonAttentionState
 
     @staticmethod
@@ -42,7 +44,7 @@ class MockAttentionBackend(AttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
-    ) -> Tuple[int, ...]:
+    ) -> tuple[int, ...]:
         raise NotImplementedError
 
     @staticmethod
@@ -55,7 +57,7 @@ class MockAttentionBackend(AttentionBackend):
 
     @staticmethod
     def copy_blocks(
-        kv_caches: List[torch.Tensor],
+        kv_caches: list[torch.Tensor],
         src_to_dists: torch.Tensor,
     ) -> None:
         pass
@@ -74,6 +76,7 @@ def test_model_runner_input():
         num_decode_tokens=3,
         slot_mapping=torch.zeros(1),
         multi_modal_placeholder_index_maps=None,
+        enable_kv_scales_calculation=True,
     )
     model_input = ModelInputForGPUWithSamplingMetadata(
         input_tokens=torch.ones(10),
@@ -126,6 +129,7 @@ def test_embedding_model_runner_input():
         num_decode_tokens=3,
         slot_mapping=torch.zeros(1),
         multi_modal_placeholder_index_maps=None,
+        enable_kv_scales_calculation=True,
     )
     model_input = ModelInputForGPUWithPoolingMetadata(
         input_tokens=torch.ones(10),
@@ -177,6 +181,7 @@ def test_multi_step_model_runner_input():
         num_decode_tokens=3,
         slot_mapping=torch.zeros(1),
         multi_modal_placeholder_index_maps=None,
+        enable_kv_scales_calculation=True,
     )
     frozen_model_input = ModelInputForGPUWithSamplingMetadata(
         input_tokens=torch.ones(10),
@@ -204,32 +209,32 @@ def test_multi_step_model_runner_input():
     received_model_input = (StatefulModelInput.from_broadcasted_tensor_dict(
         tensor_dict, attn_backend=attn_backend))
 
-    receieved_frozen_input = received_model_input.frozen_model_input
+    received_frozen_input = received_model_input.frozen_model_input
 
     # Check that received copy has correct values.
     assert isinstance(received_model_input, StatefulModelInput)
-    assert receieved_frozen_input.input_tokens is not None
-    assert (receieved_frozen_input.input_tokens ==
+    assert received_frozen_input.input_tokens is not None
+    assert (received_frozen_input.input_tokens ==
             frozen_model_input.input_tokens).all()
-    assert receieved_frozen_input.input_positions is not None
-    assert (receieved_frozen_input.input_positions ==
+    assert received_frozen_input.input_positions is not None
+    assert (received_frozen_input.input_positions ==
             frozen_model_input.input_positions).all()
-    assert receieved_frozen_input.multi_modal_kwargs is None
+    assert received_frozen_input.multi_modal_kwargs is None
     assert (frozen_model_input.multi_modal_kwargs ==
             frozen_model_input.multi_modal_kwargs)
-    assert receieved_frozen_input.lora_requests is None
-    assert (receieved_frozen_input.lora_requests ==
+    assert received_frozen_input.lora_requests is None
+    assert (received_frozen_input.lora_requests ==
             frozen_model_input.lora_requests)
-    assert receieved_frozen_input.lora_mapping is None
+    assert received_frozen_input.lora_mapping is None
     assert (
-        receieved_frozen_input.lora_mapping == frozen_model_input.lora_mapping)
+        received_frozen_input.lora_mapping == frozen_model_input.lora_mapping)
     for field in dataclasses.fields(AttentionMetadata):
-        assert getattr(receieved_frozen_input.attn_metadata, field.name,
+        assert getattr(received_frozen_input.attn_metadata, field.name,
                        None) == getattr(attn_metadata, field.name, None)
     # For sampling metadata, only selected_token_indices is copied.
-    assert (receieved_frozen_input.sampling_metadata.selected_token_indices ==
+    assert (received_frozen_input.sampling_metadata.selected_token_indices ==
             sampling_metadata.selected_token_indices)
-    assert receieved_frozen_input.sampling_metadata.seq_groups is None
+    assert received_frozen_input.sampling_metadata.seq_groups is None
 
     # check non frozen fields
     assert received_model_input.is_last_step == model_input.is_last_step

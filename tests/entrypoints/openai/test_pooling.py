@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import base64
 
 import numpy as np
 import pytest
 import requests
 
+from tests.models.utils import check_embeddings_close
 from vllm.entrypoints.openai.protocol import PoolingResponse
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
@@ -82,7 +86,7 @@ async def test_single_pooling(server: RemoteOpenAIServer, model_name: str):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
 async def test_batch_pooling(server: RemoteOpenAIServer, model_name: str):
-    # test List[str]
+    # test list[str]
     input_texts = [
         "The cat sat on the mat.", "A feline was resting on a rug.",
         "Stars twinkle brightly in the night sky."
@@ -105,7 +109,7 @@ async def test_batch_pooling(server: RemoteOpenAIServer, model_name: str):
     assert poolings.usage.prompt_tokens == 25
     assert poolings.usage.total_tokens == 25
 
-    # test List[List[int]]
+    # test list[list[int]]
     input_tokens = [[4, 5, 7, 9, 20], [15, 29, 499], [24, 24, 24, 24, 24],
                     [25, 32, 64, 77]]
     response = requests.post(
@@ -220,8 +224,11 @@ async def test_batch_base64_pooling(server: RemoteOpenAIServer,
             np.frombuffer(base64.b64decode(data.data),
                           dtype="float32").tolist())
 
-    assert responses_float.data[0].data == decoded_responses_base64_data[0]
-    assert responses_float.data[1].data == decoded_responses_base64_data[1]
+    check_embeddings_close(
+        embeddings_0_lst=[d.data for d in responses_float.data],
+        embeddings_1_lst=decoded_responses_base64_data,
+        name_0="float32",
+        name_1="base64")
 
     # Default response is float32 decoded from base64 by OpenAI Client
     default_response = requests.post(
@@ -234,5 +241,8 @@ async def test_batch_base64_pooling(server: RemoteOpenAIServer,
     default_response.raise_for_status()
     responses_default = PoolingResponse.model_validate(default_response.json())
 
-    assert responses_float.data[0].data == responses_default.data[0].data
-    assert responses_float.data[1].data == responses_default.data[1].data
+    check_embeddings_close(
+        embeddings_0_lst=[d.data for d in responses_default.data],
+        embeddings_1_lst=[d.data for d in responses_default.data],
+        name_0="float32",
+        name_1="base64")

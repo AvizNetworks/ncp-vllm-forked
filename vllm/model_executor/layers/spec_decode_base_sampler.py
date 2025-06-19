@@ -1,9 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from abc import abstractmethod
-from typing import Dict, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.jit
 import torch.nn as nn
+
+from vllm.platforms import current_platform
 
 
 class SpecDecodeBaseSampler(nn.Module):
@@ -33,7 +38,7 @@ class SpecDecodeBaseSampler(nn.Module):
     def init_gpu_tensors(self, device: Union[int, str]) -> None:
         assert self.num_accepted_tokens is None
         if isinstance(device, int):
-            device = f"cuda:{device}"
+            device = f"{current_platform.device_type}:{device}"
         elif not isinstance(device, str):
             raise ValueError(f"Device must be int or str, get {type(device)}")
         self.num_accepted_tokens = torch.tensor(0,
@@ -249,6 +254,6 @@ class SpecDecodeStochasticBaseSampler(SpecDecodeBaseSampler):
         bonus_token_ids: torch.Tensor,
         draft_probs: torch.Tensor,
         draft_token_ids: torch.Tensor,
-        seeded_seqs: Optional[Dict[int, torch.Generator]] = None,
+        seeded_seqs: Optional[dict[int, torch.Generator]] = None,
     ) -> torch.Tensor:
         raise NotImplementedError

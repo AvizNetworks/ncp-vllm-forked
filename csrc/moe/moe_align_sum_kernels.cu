@@ -3,7 +3,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <ATen/ATen.h>
-#include <THC/THCAtomics.cuh>
+#include <ATen/cuda/Atomic.cuh>
 
 #include "../cuda_compat.h"
 #include "../dispatch_utils.h"
@@ -13,189 +13,74 @@
 namespace vllm {
 namespace moe {
 
-namespace {
-__device__ __forceinline__ int32_t index(int32_t total_col, int32_t row,
-                                         int32_t col) {
-  // don't worry about overflow because num_experts is relatively small
-  return row * total_col + col;
-}
-}  // namespace
-
 template <typename scalar_t>
-__global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
-                                            int32_t* sorted_token_ids,
-                                            int32_t* expert_ids,
-                                            int32_t* total_tokens_post_pad,
-                                            int32_t num_experts,
-                                            int32_t block_size, size_t numel) {
-  const size_t tokens_per_thread = CEILDIV(numel, blockDim.x);
-  const size_t start_idx = threadIdx.x * tokens_per_thread;
+__global__ void moe_align_block_size_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
+    int32_t padded_num_experts, int32_t experts_per_warp, int32_t block_size,
+    size_t numel, int32_t* __restrict__ cumsum) {
+  extern __shared__ int32_t shared_counts[];
 
-  extern __shared__ int32_t shared_mem[];
+  const int warp_id = threadIdx.x / WARP_SIZE;
+  const int my_expert_start = warp_id * experts_per_warp;
 
-  int32_t* tokens_cnts =
-      shared_mem;  // 2d tensor with shape (blockDim.x + 1, num_experts)
-  int32_t* cumsum =
-      shared_mem +
-      (blockDim.x + 1) * num_experts;  // 1d tensor with shape (num_experts + 1)
-
-  for (int i = 0; i < num_experts; ++i) {
-    tokens_cnts[index(num_experts, threadIdx.x + 1, i)] = 0;
-  }
-
-  /**
-   * In the first step we compute token_cnts[thread_index + 1][expert_index],
-   * which counts how many tokens in the token shard of thread_index are
-   * assigned to expert expert_index.
-   */
-  for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
-    ++tokens_cnts[index(num_experts, threadIdx.x + 1, topk_ids[i])];
-  }
-
-  __syncthreads();
-
-  // For each expert we accumulate the token counts from the different threads.
-  if (threadIdx.x < num_experts) {
-    tokens_cnts[index(num_experts, 0, threadIdx.x)] = 0;
-    for (int i = 1; i <= blockDim.x; ++i) {
-      tokens_cnts[index(num_experts, i, threadIdx.x)] +=
-          tokens_cnts[index(num_experts, i - 1, threadIdx.x)];
+  for (int i = 0; i < experts_per_warp; ++i) {
+    if (my_expert_start + i < padded_num_experts) {
+      shared_counts[warp_id * experts_per_warp + i] = 0;
     }
   }
 
   __syncthreads();
 
-  // We accumulate the token counts of all experts in thread 0.
+  const size_t tid = threadIdx.x;
+  const size_t stride = blockDim.x;
+
+  for (size_t i = tid; i < numel; i += stride) {
+    int expert_id = topk_ids[i];
+    int warp_idx = expert_id / experts_per_warp;
+    int expert_offset = expert_id % experts_per_warp;
+    atomicAdd(&shared_counts[warp_idx * experts_per_warp + expert_offset], 1);
+  }
+
+  __syncthreads();
+
   if (threadIdx.x == 0) {
     cumsum[0] = 0;
     for (int i = 1; i <= num_experts; ++i) {
-      cumsum[i] = cumsum[i - 1] +
-                  CEILDIV(tokens_cnts[index(num_experts, blockDim.x, i - 1)],
-                          block_size) *
-                      block_size;
+      int expert_count = 0;
+      int warp_idx = (i - 1) / experts_per_warp;
+      int expert_offset = (i - 1) % experts_per_warp;
+      expert_count = shared_counts[warp_idx * experts_per_warp + expert_offset];
+
+      cumsum[i] =
+          cumsum[i - 1] + CEILDIV(expert_count, block_size) * block_size;
     }
     *total_tokens_post_pad = cumsum[num_experts];
   }
 
   __syncthreads();
 
-  /**
-   * For each expert, each thread processes the tokens of the corresponding
-   * blocks and stores the corresponding expert_id for each block.
-   */
   if (threadIdx.x < num_experts) {
     for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1];
          i += block_size) {
       expert_ids[i / block_size] = threadIdx.x;
     }
-  }
-
-  /**
-   * Each thread processes a token shard, calculating the index of each token
-   * after sorting by expert number. Given the example topk_ids =
-   * [0,1,2,1,2,3,0,3,4] and block_size = 4, then the output would be [0, 6, *,
-   * *, 1, 3, *, *, 2, 4, *, *, 5, 7, *, *, 8, *, *, *], where * represents a
-   * padding value(preset in python).
-   */
-  for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
-    int32_t expert_id = topk_ids[i];
-    /** The cumsum[expert_id] stores the starting index of the tokens that the
-     * expert with expert_id needs to process, and
-     * tokens_cnts[threadIdx.x][expert_id] stores the indices of the tokens
-     * processed by the expert with expert_id within the current thread's token
-     * shard.
-     */
-    int32_t rank_post_pad =
-        tokens_cnts[index(num_experts, threadIdx.x, expert_id)] +
-        cumsum[expert_id];
-    sorted_token_ids[rank_post_pad] = i;
-    ++tokens_cnts[index(num_experts, threadIdx.x, expert_id)];
   }
 }
 
-// TODO(simon): this is temporarily adapted from
-// https://github.com/sgl-project/sglang/commit/31548116a8dc8c6df7e146e0587335a59fc5b9d7
-// we did this to unblock Deepseek V3 but there should be a better
-// implementation to manage shared memory.
 template <typename scalar_t>
-__global__ void moe_align_block_size_global_mem_kernel(
-    scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
-    int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
-    int32_t block_size, size_t numel, int32_t* tokens_cnts, int32_t* cumsum) {
-  const size_t tokens_per_thread = CEILDIV(numel, blockDim.x);
-  const size_t start_idx = threadIdx.x * tokens_per_thread;
+__global__ void count_and_sort_expert_tokens_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ cumsum_buffer,
+    size_t numel) {
+  const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t stride = blockDim.x * gridDim.x;
 
-  for (int i = 0; i < num_experts; ++i) {
-    tokens_cnts[index(num_experts, threadIdx.x + 1, i)] = 0;
-  }
-
-  /**
-   * In the first step we compute token_cnts[thread_index + 1][expert_index],
-   * which counts how many tokens in the token shard of thread_index are
-   * assigned to expert expert_index.
-   */
-  for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
-    ++tokens_cnts[index(num_experts, threadIdx.x + 1, topk_ids[i])];
-  }
-
-  __syncthreads();
-
-  // For each expert we accumulate the token counts from the different threads.
-  if (threadIdx.x < num_experts) {
-    tokens_cnts[index(num_experts, 0, threadIdx.x)] = 0;
-    for (int i = 1; i <= blockDim.x; ++i) {
-      tokens_cnts[index(num_experts, i, threadIdx.x)] +=
-          tokens_cnts[index(num_experts, i - 1, threadIdx.x)];
-    }
-  }
-
-  __syncthreads();
-
-  // We accumulate the token counts of all experts in thread 0.
-  if (threadIdx.x == 0) {
-    cumsum[0] = 0;
-    for (int i = 1; i <= num_experts; ++i) {
-      cumsum[i] = cumsum[i - 1] +
-                  CEILDIV(tokens_cnts[index(num_experts, blockDim.x, i - 1)],
-                          block_size) *
-                      block_size;
-    }
-    *total_tokens_post_pad = cumsum[num_experts];
-  }
-
-  __syncthreads();
-
-  /**
-   * For each expert, each thread processes the tokens of the corresponding
-   * blocks and stores the corresponding expert_id for each block.
-   */
-  if (threadIdx.x < num_experts) {
-    for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1];
-         i += block_size) {
-      expert_ids[i / block_size] = threadIdx.x;
-    }
-  }
-
-  /**
-   * Each thread processes a token shard, calculating the index of each token
-   * after sorting by expert number. Given the example topk_ids =
-   * [0,1,2,1,2,3,0,3,4] and block_size = 4, then the output would be [0, 6, *,
-   * *, 1, 3, *, *, 2, 4, *, *, 5, 7, *, *, 8, *, *, *], where * represents a
-   * padding value(preset in python).
-   */
-  for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
+  for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
-    /** The cumsum[expert_id] stores the starting index of the tokens that the
-     * expert with expert_id needs to process, and
-     * tokens_cnts[threadIdx.x][expert_id] stores the indices of the tokens
-     * processed by the expert with expert_id within the current thread's token
-     * shard.
-     */
-    int32_t rank_post_pad =
-        tokens_cnts[index(num_experts, threadIdx.x, expert_id)] +
-        cumsum[expert_id];
+    int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
     sorted_token_ids[rank_post_pad] = i;
-    ++tokens_cnts[index(num_experts, threadIdx.x, expert_id)];
   }
 }
 
@@ -215,69 +100,139 @@ __global__ void moe_sum_kernel(
   }
 }
 
+template <typename scalar_t>
+__global__ void moe_align_block_size_small_batch_expert_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
+    int32_t block_size, size_t numel) {
+  const size_t tid = threadIdx.x;
+  const size_t stride = blockDim.x;
+
+  extern __shared__ int32_t shared_mem[];
+  int32_t* cumsum = shared_mem;
+  int32_t* tokens_cnts = (int32_t*)(shared_mem + num_experts + 1);
+
+  for (int i = 0; i < num_experts; ++i) {
+    tokens_cnts[(threadIdx.x + 1) * num_experts + i] = 0;
+  }
+
+  for (size_t i = tid; i < numel; i += stride) {
+    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i]];
+  }
+
+  __syncthreads();
+
+  if (threadIdx.x < num_experts) {
+    tokens_cnts[threadIdx.x] = 0;
+    for (int i = 1; i <= blockDim.x; ++i) {
+      tokens_cnts[i * num_experts + threadIdx.x] +=
+          tokens_cnts[(i - 1) * num_experts + threadIdx.x];
+    }
+  }
+
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    cumsum[0] = 0;
+    for (int i = 1; i <= num_experts; ++i) {
+      cumsum[i] =
+          cumsum[i - 1] +
+          CEILDIV(tokens_cnts[blockDim.x * num_experts + i - 1], block_size) *
+              block_size;
+    }
+    *total_tokens_post_pad = static_cast<int32_t>(cumsum[num_experts]);
+  }
+
+  __syncthreads();
+
+  if (threadIdx.x < num_experts) {
+    for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1];
+         i += block_size) {
+      expert_ids[i / block_size] = threadIdx.x;
+    }
+  }
+
+  for (size_t i = tid; i < numel; i += stride) {
+    int32_t expert_id = topk_ids[i];
+    int32_t rank_post_pad =
+        tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
+    sorted_token_ids[rank_post_pad] = i;
+    ++tokens_cnts[threadIdx.x * num_experts + expert_id];
+  }
+}
+
 }  // namespace moe
 }  // namespace vllm
 
+// taken from
+// https://github.com/sgl-project/sglang/blob/8b5f83ed3b7d2a49ad5c5cd5aa61c5d502f47dbc
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           int64_t block_size, torch::Tensor sorted_token_ids,
                           torch::Tensor experts_ids,
                           torch::Tensor num_tokens_post_pad) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  // If we have very large number of experts, we can no longer use shared
-  // memory.
-  // TODO(simon): the right solution should be calculating the exact right
-  // amount of shared memory and use that. The num_experts >= 256 is just a
-  // temporary solution to unblock Deepseek V3.
-  if (num_experts >= 256) {
-    VLLM_DISPATCH_INTEGRAL_TYPES(
-        topk_ids.scalar_type(), "moe_align_block_size_global_mem_kernel", [&] {
-          // calc needed amount of shared mem for `tokens_cnts` and `cumsum`
-          // tensors
-          const int32_t num_thread = max((int32_t)num_experts, WARP_SIZE);
+  int64_t padded_num_experts =
+      ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+  int experts_per_warp = WARP_SIZE;
+  int threads = 1024;
+  threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
-          const int32_t mem_tokens_cnts =
-              ((num_experts + 1) * num_experts) * sizeof(int32_t);
-          const int32_t mem_cumsum = (num_experts + 1) * sizeof(int32_t);
-          // allocate global memory
-          int32_t* tokens_cnts;
-          int32_t* cumsum;
-          cudaMalloc(&tokens_cnts, mem_tokens_cnts);
-          cudaMalloc(&cumsum, mem_cumsum);
+  VLLM_DISPATCH_INTEGRAL_AND_UNSIGNED_TYPES(
+      topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
+        // calc needed amount of shared mem for `cumsum` tensors
+        auto options_int =
+            torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
+        torch::Tensor cumsum_buffer =
+            torch::zeros({num_experts + 1}, options_int);
+        bool small_batch_expert_mode =
+            (topk_ids.numel() < 1024) && (num_experts <= 64);
 
-          auto kernel =
-              vllm::moe::moe_align_block_size_global_mem_kernel<scalar_t>;
-          kernel<<<1, num_thread, 0, stream>>>(
-              topk_ids.data_ptr<scalar_t>(),
-              sorted_token_ids.data_ptr<int32_t>(),
-              experts_ids.data_ptr<int32_t>(),
-              num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
-              topk_ids.numel(), tokens_cnts, cumsum);
-          cudaFree(tokens_cnts);
-          cudaFree(cumsum);
-        });
-  } else {
-    VLLM_DISPATCH_INTEGRAL_TYPES(
-        topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
-          // calc needed amount of shared mem for `tokens_cnts` and `cumsum`
-          // tensors
-          const int32_t num_thread = max((int32_t)num_experts, WARP_SIZE);
-          const int32_t shared_mem =
-              ((num_thread + 1) * num_experts + (num_experts + 1)) *
+        if (small_batch_expert_mode) {
+          const int32_t threads = max((int32_t)num_experts, WARP_SIZE);
+          const int32_t shared_mem_size =
+              ((threads + 1) * num_experts + (num_experts + 1)) *
               sizeof(int32_t);
 
-          // set dynamic shared mem
-          auto kernel = vllm::moe::moe_align_block_size_kernel<scalar_t>;
-          AT_CUDA_CHECK(VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(
-              (void*)kernel, shared_mem));
-          kernel<<<1, num_thread, shared_mem, stream>>>(
+          auto small_batch_expert_kernel =
+              vllm::moe::moe_align_block_size_small_batch_expert_kernel<
+                  scalar_t>;
+          small_batch_expert_kernel<<<1, threads, shared_mem_size, stream>>>(
               topk_ids.data_ptr<scalar_t>(),
               sorted_token_ids.data_ptr<int32_t>(),
               experts_ids.data_ptr<int32_t>(),
               num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
               topk_ids.numel());
-        });
-  }
+        } else {
+          auto align_kernel = vllm::moe::moe_align_block_size_kernel<scalar_t>;
+
+          size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
+          size_t shared_mem_size =
+              num_warps * experts_per_warp * sizeof(int32_t);
+
+          align_kernel<<<1, threads, shared_mem_size, stream>>>(
+              topk_ids.data_ptr<scalar_t>(),
+              sorted_token_ids.data_ptr<int32_t>(),
+              experts_ids.data_ptr<int32_t>(),
+              num_tokens_post_pad.data_ptr<int32_t>(), num_experts,
+              padded_num_experts, experts_per_warp, block_size,
+              topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
+
+          const int block_threads = std::min(256, (int)threads);
+          const int num_blocks =
+              (topk_ids.numel() + block_threads - 1) / block_threads;
+          const int max_blocks = 65535;
+          const int actual_blocks = std::min(num_blocks, max_blocks);
+
+          auto sort_kernel =
+              vllm::moe::count_and_sort_expert_tokens_kernel<scalar_t>;
+          sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
+              topk_ids.data_ptr<scalar_t>(),
+              sorted_token_ids.data_ptr<int32_t>(),
+              cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel());
+        }
+      });
 }
 
 void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]

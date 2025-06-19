@@ -1,10 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import asyncio
 import os
 import uuid
 from asyncio import CancelledError
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
 import pytest
 import pytest_asyncio
@@ -39,7 +42,7 @@ class MockEngine:
         self.abort_request_calls = 0
         self.request_id = None
         # Ugly, remove dependency when possible
-        self.parallel_config = ParallelConfig(1, 1, False)
+        self.parallel_config = ParallelConfig()
         self.model_config = MockModelConfig()
 
     async def step_async(self, virtual_engine):
@@ -149,6 +152,10 @@ def uid() -> str:
 
 @pytest_asyncio.fixture(scope="module")
 async def async_engine():
+    # We cannot use monkeypatch since this is a module
+    # scoped fixture and monkeypatch is function scoped.
+    previous_value = os.getenv("VLLM_USE_V1", None)
+    os.environ["VLLM_USE_V1"] = "0"
     engine = await asyncio.get_event_loop().run_in_executor(executor=None,
                                                             func=start_engine)
     try:
@@ -158,6 +165,11 @@ async def async_engine():
         del engine
         await asyncio.sleep(0.1)
         cleanup_dist_env_and_memory()
+
+        if previous_value:
+            os.environ["VLLM_USE_V1"] = previous_value
+        else:
+            del os.environ["VLLM_USE_V1"]
 
 
 @pytest.fixture()
@@ -252,7 +264,7 @@ async def test_output_kinds(async_engine, stop):
         params.output_kind = RequestOutputKind.DELTA
 
         prompt_tokens = None
-        output_tokens: List[int] = []
+        output_tokens: list[int] = []
         output_text = ""
         output_count = 0
         final_output = None
@@ -372,3 +384,25 @@ async def test_delayed_generator(async_engine, stop):
     assert final_output is not None
     assert len(final_output.outputs[0].token_ids) == 10
     assert final_output.finished
+
+
+@pytest.mark.asyncio(scope="module")
+async def test_invalid_argument(async_engine):
+    scheduler_config = await async_engine.get_scheduler_config()
+
+    if scheduler_config.num_scheduler_steps != 1:
+        pytest.skip("no need to test this one with multistep")
+
+    sampling_params = SamplingParams(
+        temperature=0,
+        min_tokens=10,
+        max_tokens=10,
+    )
+
+    # Targeting specific DP rank only supported in v1 multi-instance DP
+    with pytest.raises(ValueError):
+        async for _ in async_engine.generate("test",
+                                             sampling_params,
+                                             request_id=uid(),
+                                             data_parallel_rank=0):
+            pass

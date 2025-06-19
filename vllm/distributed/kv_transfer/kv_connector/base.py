@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 KVConnectorBase Class for Distributed KV Cache & Hidden State communication
 
@@ -7,10 +9,11 @@ The class provides two primary abstract methods:
 """
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
 from vllm.sequence import IntermediateTensors
 
 if TYPE_CHECKING:
@@ -53,7 +56,7 @@ class KVConnectorBase(ABC):
         self,
         model_executable: torch.nn.Module,
         model_input: "ModelInputForGPUWithSamplingMetadata",
-        kv_caches: List[torch.Tensor],
+        kv_caches: list[torch.Tensor],
         hidden_or_intermediate_states: Union[torch.Tensor,
                                              IntermediateTensors],
     ) -> None:
@@ -69,7 +72,7 @@ class KVConnectorBase(ABC):
                 start and end layer information.
             model_input (ModelInputForGPUWithSamplingMetadata): The input
                 metadata from vLLM.
-            kv_caches (List[torch.Tensor]): List of KV caches (keys and values) 
+            kv_caches (list[torch.Tensor]): List of KV caches (keys and values) 
                 for each layer.
             hidden_or_intermediate_states (Union[torch.Tensor, 
             IntermediateTensors]): 
@@ -86,8 +89,8 @@ class KVConnectorBase(ABC):
     def recv_kv_caches_and_hidden_states(
         self, model_executable: torch.nn.Module,
         model_input: "ModelInputForGPUWithSamplingMetadata",
-        kv_caches: List[torch.Tensor]
-    ) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool,
+        kv_caches: list[torch.Tensor]
+    ) -> tuple[Union[torch.Tensor, IntermediateTensors], bool,
                "ModelInputForGPUWithSamplingMetadata"]:
         """
         Receive KV caches and hidden states from the connector.
@@ -102,7 +105,7 @@ class KVConnectorBase(ABC):
                 The model executable from vLLM modelrunner.
             model_input (ModelInputForGPUWithSamplingMetadata): 
                 The model input from vLLM modelrunner.
-            kv_caches (List[torch.Tensor]): 
+            kv_caches (list[torch.Tensor]): 
                 List of KV caches for each layer.
 
         Returns:
@@ -120,3 +123,6 @@ class KVConnectorBase(ABC):
         """
 
         raise NotImplementedError
+
+
+KVConnectorBaseType = Union[KVConnectorBase, KVConnectorBase_V1]

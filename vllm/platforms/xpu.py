@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from vllm.logger import init_logger
+from vllm.utils import DEFAULT_MAX_NUM_BATCHED_TOKENS
 
 from .interface import DeviceCapability, Platform, PlatformEnum, _Backend
 
@@ -27,20 +31,24 @@ class XPUPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(cls, selected_backend: _Backend, head_size: int,
                              dtype: torch.dtype, kv_cache_dtype: Optional[str],
-                             block_size: int, use_v1: bool) -> str:
+                             block_size: int, use_v1: bool,
+                             use_mla: bool) -> str:
         if selected_backend != _Backend.IPEX:
             logger.info("Cannot use %s backend on XPU.", selected_backend)
         logger.info("Using IPEX attention backend.")
         return "vllm.attention.backends.ipex_attn.IpexAttnBackend"
 
-    @staticmethod
-    def get_device_capability(device_id: int = 0) -> DeviceCapability:
-        major, minor, *_ = torch.xpu.get_device_capability(
-            device_id)['version'].split('.')
-        return DeviceCapability(major=int(major), minor=int(minor))
+    @classmethod
+    def get_device_capability(
+        cls,
+        device_id: int = 0,
+    ) -> Optional[DeviceCapability]:
+        # capacity format differs from cuda's and will cause unexpected
+        # failure, so use None directly
+        return None
 
-    @staticmethod
-    def get_device_name(device_id: int = 0) -> str:
+    @classmethod
+    def get_device_name(cls, device_id: int = 0) -> str:
         return torch.xpu.get_device_name(device_id)
 
     @classmethod
@@ -52,8 +60,8 @@ class XPUPlatform(Platform):
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
         return True
 
-    @staticmethod
-    def inference_mode():
+    @classmethod
+    def inference_mode(cls):
         return torch.no_grad()
 
     @classmethod
@@ -65,9 +73,14 @@ class XPUPlatform(Platform):
         # check and update model config
         model_config = vllm_config.model_config
         if model_config.dtype == torch.bfloat16:
-            logger.warning(
-                "bfloat16 is not fully supported on XPU, casting to float16.")
-            model_config.dtype = torch.float16
+            bf16_supported = cls.device_support_bf16()
+            if not bf16_supported:
+                logger.warning(
+                    "bfloat16 is only supported on Intel Data Center GPU, "
+                    "Intel Arc GPU is not supported yet. Your device is %s,"
+                    " which is not supported. will fallback to float16",
+                    cls.get_device_name())
+                model_config.dtype = torch.float16
         if not model_config.enforce_eager:
             logger.warning(
                 "CUDA graph is not supported on XPU, fallback to the eager "
@@ -104,6 +117,16 @@ class XPUPlatform(Platform):
                 parallel_config.distributed_executor_backend)
             parallel_config.distributed_executor_backend = "ray"
 
+        if vllm_config.model_config and vllm_config.model_config.use_mla:
+            logger.info(
+                "MLA is enabled on a non-GPU platform; forcing chunked "
+                "prefill and prefix caching to be disabled.")
+            vllm_config.scheduler_config.enable_chunked_prefill = False
+            vllm_config.scheduler_config.chunked_prefill_enabled = False
+            vllm_config.scheduler_config.max_num_batched_tokens = max(
+                vllm_config.scheduler_config.max_model_len,
+                DEFAULT_MAX_NUM_BATCHED_TOKENS)
+
     @classmethod
     def is_pin_memory_available(cls):
         logger.warning("Pin memory is not supported on XPU.")
@@ -115,3 +138,19 @@ class XPUPlatform(Platform):
                                  ) -> float:
         torch.xpu.reset_peak_memory_stats(device)
         return torch.xpu.max_memory_allocated(device)
+
+    @classmethod
+    def device_support_bf16(cls) -> bool:
+        device_name = cls.get_device_name().lower()
+        if device_name.count("arc") > 0:
+            return False
+        elif device_name.count("data center gpu") > 0:
+            return True
+        else:
+            logger.warning("Unknown device name %s, always use float16",
+                           device_name)
+            return False
+
+    @classmethod
+    def get_device_communicator_cls(cls) -> str:
+        return "vllm.distributed.device_communicators.xpu_communicator.XpuCommunicator"  # noqa
