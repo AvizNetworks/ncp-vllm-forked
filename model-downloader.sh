@@ -73,9 +73,20 @@ if [[ "$DATASET" == 1 ]]; then
 fi
 echo "Downloading to ./$MODEL_DIR"
 
+# Pass authentication as an ephemeral HTTP header so the token is not written
+# to .git/config or printed as part of the repository URL.
+git_auth_args=()
+if [[ -n "$HF_TOKEN" ]]; then
+    git_auth_args=(-c "http.extraHeader=Authorization: Bearer ${HF_TOKEN}")
+fi
+
 if [ -d "$MODEL_DIR/.git" ]; then
     printf "${YELLOW}%s exists, Skip Clone.\n${NC}" "$MODEL_DIR"
-    cd "$MODEL_DIR" && GIT_LFS_SKIP_SMUDGE=1 git pull || { printf "Git pull failed.\n"; exit 1; }
+    cd "$MODEL_DIR" && GIT_LFS_SKIP_SMUDGE=1 \
+        git "${git_auth_args[@]}" pull || {
+        printf "Git pull failed.\n"
+        exit 1
+    }
 else
     REPO_URL="$HF_ENDPOINT/$MODEL_ID"
     GIT_REFS_URL="${REPO_URL}/info/refs?service=git-upload-pack"
@@ -86,13 +97,16 @@ else
             printf "${RED}HTTP Status Code: $response.\nThe repository requires authentication, but --hf_username and --hf_token is not passed. Please get token from https://huggingface.co/settings/tokens.\nExiting.\n${NC}"
             exit 1
         fi
-        REPO_URL="https://$HF_USERNAME:$HF_TOKEN@${HF_ENDPOINT#https://}/$MODEL_ID"
     elif [ "$response" != "200" ]; then
         echo -e "${RED}Unexpected HTTP Status Code: $response.\nExiting.\n${NC}"; exit 1
     fi
     echo "git clone $REPO_URL"
 
-    GIT_LFS_SKIP_SMUDGE=1 git clone "$REPO_URL" && cd "$MODEL_DIR" || { printf "${RED}Git clone failed.\n${NC}"; exit 1; }
+    GIT_LFS_SKIP_SMUDGE=1 git "${git_auth_args[@]}" clone "$REPO_URL" \
+        && cd "$MODEL_DIR" || {
+        printf "${RED}Git clone failed.\n${NC}"
+        exit 1
+    }
     for file in $(git lfs ls-files | awk '{print $3}'); do
         truncate -s 0 "$file"
     done
@@ -108,10 +122,10 @@ for file in $files; do
     mkdir -p "$file_dir"
     if [[ "$TOOL" == "wget" ]]; then
         download_cmd="wget -c \"$url\" -O \"$file\""
-        [[ -n "$HF_TOKEN" ]] && download_cmd="wget --header=\"Authorization: Bearer ${HF_TOKEN}\" -c \"$url\" -O \"$file\""
+        [[ -n "$HF_TOKEN" ]] && download_cmd="wget --header=\"Authorization: Bearer <REDACTED>\" -c \"$url\" -O \"$file\""
     else
         download_cmd="aria2c -x $THREADS -s $THREADS -k 1M -c \"$url\" -d \"$file_dir\" -o \"$(basename "$file")\""
-        [[ -n "$HF_TOKEN" ]] && download_cmd="aria2c --header=\"Authorization: Bearer ${HF_TOKEN}\" -x $THREADS -s $THREADS -k 1M -c \"$url\" -d \"$file_dir\" -o \"$(basename "$file")\""
+        [[ -n "$HF_TOKEN" ]] && download_cmd="aria2c --header=\"Authorization: Bearer <REDACTED>\" -x $THREADS -s $THREADS -k 1M -c \"$url\" -d \"$file_dir\" -o \"$(basename "$file")\""
     fi
     [[ -n "$INCLUDE_PATTERN" && $file != *"$INCLUDE_PATTERN"* ]] && printf "# %s\n" "$download_cmd" && continue
     #[[ -n "$EXCLUDE_PATTERN" && $file == *"$EXCLUDE_PATTERN"* ]] && printf "# %s\n" "$download_cmd" && continue
@@ -125,9 +139,21 @@ for url_file in "${urls[@]}"; do
     IFS='|' read -r url file <<< "$url_file"
     file_dir=$(dirname "$file")
     if [[ "$TOOL" == "wget" ]]; then
-        [[ -n "$HF_TOKEN" ]] && wget --header="Authorization: Bearer ${HF_TOKEN}" -c "$url" -O "$file" || wget -c "$url" -O "$file"
+        if [[ -n "$HF_TOKEN" ]]; then
+            wget --header="Authorization: Bearer ${HF_TOKEN}" \
+                -c "$url" -O "$file"
+        else
+            wget -c "$url" -O "$file"
+        fi
     else
-        [[ -n "$HF_TOKEN" ]] && aria2c --header="Authorization: Bearer ${HF_TOKEN}" -x $THREADS -s $THREADS -k 1M -c "$url" -d "$file_dir" -o "$(basename "$file")" || aria2c -x $THREADS -s $THREADS -k 1M -c "$url" -d "$file_dir" -o "$(basename "$file")"
+        if [[ -n "$HF_TOKEN" ]]; then
+            aria2c --header="Authorization: Bearer ${HF_TOKEN}" \
+                -x "$THREADS" -s "$THREADS" -k 1M -c "$url" \
+                -d "$file_dir" -o "$(basename "$file")"
+        else
+            aria2c -x "$THREADS" -s "$THREADS" -k 1M -c "$url" \
+                -d "$file_dir" -o "$(basename "$file")"
+        fi
     fi
     [[ $? -eq 0 ]] && printf "Downloaded %s successfully.\n" "$url" || { printf "${RED}Failed to download %s.\n${NC}" "$url"; exit 1; }
 done
